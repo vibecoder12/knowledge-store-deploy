@@ -27,6 +27,333 @@ const logger = winston.createLogger({
     ]
 });
 
+// Session store for conversation memory
+class SessionStore {
+    constructor() {
+        this.sessions = new Map();
+        this.cleanupInterval = setInterval(() => this.cleanup(), 300000); // Clean every 5 minutes
+    }
+
+    createSession(userId, appId = 'default') {
+        const sessionToken = `sess_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const session = {
+            sessionToken,
+            userId,
+            appId,
+            conversationHistory: [],
+            entityContext: new Set(),
+            userPreferences: {
+                responseFormat: 'conversational',
+                includeCharts: true,
+                maxResults: 5
+            },
+            createdAt: new Date(),
+            lastActivity: new Date(),
+            totalQueries: 0
+        };
+        
+        this.sessions.set(sessionToken, session);
+        return sessionToken;
+    }
+
+    getSession(sessionToken) {
+        const session = this.sessions.get(sessionToken);
+        if (session) {
+            session.lastActivity = new Date();
+            return session;
+        }
+        return null;
+    }
+
+    updateSession(sessionToken, updates) {
+        const session = this.sessions.get(sessionToken);
+        if (session) {
+            Object.assign(session, updates);
+            session.lastActivity = new Date();
+            return session;
+        }
+        return null;
+    }
+
+    addToHistory(sessionToken, query, response) {
+        const session = this.sessions.get(sessionToken);
+        if (session) {
+            session.conversationHistory.push({
+                query,
+                response,
+                timestamp: new Date().toISOString(),
+                queryId: `q_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`
+            });
+            
+            // Keep only last 10 conversations
+            if (session.conversationHistory.length > 10) {
+                session.conversationHistory = session.conversationHistory.slice(-10);
+            }
+            
+            session.totalQueries++;
+        }
+    }
+
+    addEntityContext(sessionToken, entities) {
+        const session = this.sessions.get(sessionToken);
+        if (session && Array.isArray(entities)) {
+            entities.forEach(entity => {
+                if (typeof entity === 'string') {
+                    session.entityContext.add(entity.toLowerCase());
+                } else if (entity.name) {
+                    session.entityContext.add(entity.name.toLowerCase());
+                }
+            });
+        }
+    }
+
+    cleanup() {
+        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
+        for (const [token, session] of this.sessions.entries()) {
+            if (session.lastActivity < cutoff) {
+                this.sessions.delete(token);
+            }
+        }
+        logger.info(`Session cleanup completed. Active sessions: ${this.sessions.size}`);
+    }
+
+    getStats() {
+        return {
+            totalActiveSessions: this.sessions.size,
+            oldestSession: Math.min(...Array.from(this.sessions.values()).map(s => s.createdAt.getTime())),
+            totalQueries: Array.from(this.sessions.values()).reduce((sum, s) => sum + s.totalQueries, 0)
+        };
+    }
+}
+
+// Response formatter for enhanced chat responses
+class ResponseFormatter {
+    constructor() {
+        this.currencyFormatter = new Intl.NumberFormat('en-US', {
+            style: 'currency',
+            currency: 'USD',
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 1
+        });
+    }
+
+    formatAUM(amount) {
+        if (amount >= 1000000000000) {
+            return `$${(amount / 1000000000000).toFixed(1)}T`;
+        } else if (amount >= 1000000000) {
+            return `$${(amount / 1000000000).toFixed(1)}B`;
+        } else if (amount >= 1000000) {
+            return `$${(amount / 1000000).toFixed(1)}M`;
+        }
+        return this.currencyFormatter.format(amount);
+    }
+
+    generateSuggestions(queryResults, conversationContext) {
+        const suggestions = [];
+        
+        if (queryResults.results && queryResults.results.length > 0) {
+            const firstResult = queryResults.results[0];
+            
+            // Contextual suggestions based on the query type
+            if (firstResult.type === 'Private Equity Firm') {
+                suggestions.push(
+                    {
+                        text: `Tell me more about ${firstResult.name}`,
+                        action: 'detail_view',
+                        entityId: firstResult.name.toLowerCase().replace(/\s+/g, '_')
+                    },
+                    {
+                        text: 'Show portfolio companies',
+                        action: 'portfolio_view',
+                        context: 'private_equity'
+                    },
+                    {
+                        text: 'Compare with competitors',
+                        action: 'comparison',
+                        entityType: 'private_equity_firm'
+                    }
+                );
+            } else if (firstResult.type === 'Portfolio Company') {
+                suggestions.push(
+                    {
+                        text: `Who invested in ${firstResult.name}?`,
+                        action: 'investor_lookup',
+                        entityId: firstResult.name
+                    },
+                    {
+                        text: 'Show similar companies',
+                        action: 'similar_entities',
+                        sector: firstResult.sector
+                    }
+                );
+            }
+            
+            // Generic suggestions
+            if (queryResults.results.length > 1) {
+                suggestions.push({
+                    text: 'Show top 10 results',
+                    action: 'expand_results',
+                    limit: 10
+                });
+            }
+        }
+        
+        // Add conversational suggestions
+        suggestions.push(
+            {
+                text: 'What are the latest trends?',
+                action: 'trend_analysis',
+                context: 'market_trends'
+            },
+            {
+                text: 'Start a new topic',
+                action: 'reset_context'
+            }
+        );
+        
+        return suggestions.slice(0, 4); // Limit to 4 suggestions
+    }
+
+    generateVisualizations(queryResults, query) {
+        const visualizations = [];
+        
+        if (queryResults.results && queryResults.results.length > 1) {
+            const hasAUM = queryResults.results.some(r => r.aum);
+            
+            if (hasAUM) {
+                visualizations.push({
+                    type: 'bar_chart',
+                    title: 'Assets Under Management Comparison',
+                    description: 'Compare AUM across firms',
+                    dataUrl: `/api/chart/aum-comparison/${Date.now()}`,
+                    suggestedHeight: 300
+                });
+            }
+            
+            if (query.toLowerCase().includes('trend') || query.toLowerCase().includes('growth')) {
+                visualizations.push({
+                    type: 'line_chart',
+                    title: 'Growth Trends',
+                    description: 'Historical performance trends',
+                    dataUrl: `/api/chart/trends/${Date.now()}`,
+                    suggestedHeight: 250
+                });
+            }
+        }
+        
+        return visualizations;
+    }
+
+    enhanceResults(results) {
+        return results.map((result, index) => {
+            const enhanced = { ...result };
+            
+            // Format AUM
+            if (result.aum) {
+                enhanced.aumFormatted = this.formatAUM(result.aum);
+                enhanced.rank = index + 1;
+            }
+            
+            // Add highlights
+            if (result.type === 'Private Equity Firm') {
+                if (result.aum > 900000000000) {
+                    enhanced.highlight = 'One of the world\'s largest asset managers';
+                } else if (result.aum > 500000000000) {
+                    enhanced.highlight = 'Major global investment firm';
+                } else if (result.aum > 100000000000) {
+                    enhanced.highlight = 'Significant industry player';
+                }
+            }
+            
+            return enhanced;
+        });
+    }
+
+    formatEnhancedResponse(queryResults, query, session) {
+        const enhancedResults = this.enhanceResults(queryResults.results || []);
+        const suggestions = this.generateSuggestions(queryResults, session);
+        const visualizations = this.generateVisualizations(queryResults, query);
+        
+        // Generate natural language response
+        let message = this.generateNaturalResponse(enhancedResults, query, session);
+        
+        // Calculate summary statistics
+        const summary = this.generateSummary(enhancedResults);
+        
+        return {
+            type: 'enhanced_chat',
+            message,
+            data: {
+                entities: enhancedResults,
+                summary
+            },
+            suggestions,
+            visualizations
+        };
+    }
+
+    generateNaturalResponse(results, query, session) {
+        if (!results || results.length === 0) {
+            return "I couldn't find specific information for that query. Could you try rephrasing or asking about private equity firms, portfolio companies, or investment data?";
+        }
+        
+        const count = results.length;
+        const firstResult = results[0];
+        
+        let message = `I found ${count} relevant result${count > 1 ? 's' : ''} for "${query}". `;
+        
+        if (firstResult.type === 'Private Equity Firm') {
+            message += `${firstResult.name} leads`;
+            if (firstResult.aumFormatted) {
+                message += ` with ${firstResult.aumFormatted} in AUM`;
+            }
+            if (firstResult.highlight) {
+                message += `, making it ${firstResult.highlight.toLowerCase()}`;
+            }
+            message += '.';
+            
+            if (count > 1) {
+                const totalAUM = results.reduce((sum, r) => sum + (r.aum || 0), 0);
+                if (totalAUM > 0) {
+                    message += ` Together, these ${count} firms manage ${this.formatAUM(totalAUM)} in assets.`;
+                }
+            }
+        } else {
+            message += `The top result is ${firstResult.name}`;
+            if (firstResult.type) {
+                message += ` (${firstResult.type})`;
+            }
+            if (firstResult.sector) {
+                message += ` in the ${firstResult.sector} sector`;
+            }
+            message += '.';
+        }
+        
+        return message;
+    }
+
+    generateSummary(results) {
+        if (!results || results.length === 0) return null;
+        
+        const summary = {
+            totalResults: results.length
+        };
+        
+        // Calculate AUM statistics
+        const firmResults = results.filter(r => r.type === 'Private Equity Firm' && r.aum);
+        if (firmResults.length > 0) {
+            const totalAUM = firmResults.reduce((sum, r) => sum + r.aum, 0);
+            const avgAUM = totalAUM / firmResults.length;
+            
+            summary.totalAUM = this.formatAUM(totalAUM);
+            summary.avgAUM = this.formatAUM(avgAUM);
+            summary.firms = firmResults.length;
+        }
+        
+        return summary;
+    }
+}
+
 // Mock Neo4j connection for Railway deployment
 class MockNeo4jConnection {
     constructor() {
@@ -134,6 +461,8 @@ class PrivateMarketsKnowledgeStore {
         this.app = express();
         this.port = process.env.PORT || 3000;
         this.neo4j = new MockNeo4jConnection();
+        this.sessionStore = new SessionStore();
+        this.responseFormatter = new ResponseFormatter();
     }
 
     async initialize() {
@@ -203,16 +532,29 @@ class PrivateMarketsKnowledgeStore {
         this.app.get('/', (req, res) => {
             res.json({
                 message: '🎯 Welcome to Private Markets Intelligence Agent',
-                description: 'AI-powered knowledge system for private markets data',
+                description: 'AI-powered knowledge system for private markets data with enhanced wrapper service',
                 version: require('./package.json').version,
                 deployment: 'Railway - Live',
                 status: 'operational',
                 endpoints: {
+                    // Core API
                     health: '/health',
                     stats: '/api/stats',
                     query: '/api/query (POST)',
                     agent: '/api/agent/query (POST)',
-                    conversation: '/api/agent/conversation (POST)'
+                    conversation: '/api/agent/conversation (POST)',
+                    // Enhanced Wrapper Service
+                    wrapperChat: '/api/wrapper/chat (POST) - Main integration endpoint',
+                    wrapperSession: '/api/wrapper/session (POST/GET/DELETE) - Session management',
+                    wrapperStats: '/api/wrapper/stats (GET) - Wrapper service statistics'
+                },
+                features: {
+                    conversationMemory: true,
+                    contextAwareQueries: true,
+                    richResponses: true,
+                    sessionManagement: true,
+                    visualizationSuggestions: true,
+                    multiAppIntegration: true
                 },
                 documentation: 'https://github.com/vibecoder12/knowledge-store-deploy',
                 timestamp: new Date().toISOString()
@@ -371,6 +713,265 @@ class PrivateMarketsKnowledgeStore {
             }
         });
 
+        // ===========================================
+        // ENHANCED WRAPPER SERVICE ENDPOINTS
+        // ===========================================
+
+        // Enhanced wrapper chat endpoint - Main integration point for external apps
+        this.app.post('/api/wrapper/chat', async (req, res) => {
+            try {
+                const { 
+                    message, 
+                    sessionToken, 
+                    userId, 
+                    context = {},
+                    metadata = {} 
+                } = req.body;
+
+                // Validate required fields
+                if (!message || typeof message !== 'string') {
+                    return res.status(400).json({
+                        success: false,
+                        error: 'Message is required and must be a string'
+                    });
+                }
+
+                const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                const timestamp = new Date().toISOString();
+                
+                logger.info(`Enhanced wrapper chat: ${message.substring(0, 100)}`, { 
+                    requestId, 
+                    sessionToken, 
+                    userId, 
+                    appId: context.appId 
+                });
+
+                // Get or create session
+                let session;
+                if (sessionToken) {
+                    session = this.sessionStore.getSession(sessionToken);
+                    if (!session) {
+                        logger.warn(`Session not found: ${sessionToken}, creating new session`);
+                        const newToken = this.sessionStore.createSession(userId || 'anonymous', context.appId);
+                        session = this.sessionStore.getSession(newToken);
+                    }
+                } else {
+                    const newToken = this.sessionStore.createSession(userId || 'anonymous', context.appId);
+                    session = this.sessionStore.getSession(newToken);
+                }
+
+                // Update user preferences if provided
+                if (context.userPreferences) {
+                    this.sessionStore.updateSession(session.sessionToken, {
+                        userPreferences: { ...session.userPreferences, ...context.userPreferences }
+                    });
+                    session = this.sessionStore.getSession(session.sessionToken);
+                }
+
+                // Enhance query with conversation context
+                let enhancedQuery = message;
+                if (session.conversationHistory.length > 0) {
+                    const recentContext = Array.from(session.entityContext).slice(-5);
+                    if (recentContext.length > 0 && !message.toLowerCase().includes(recentContext[0])) {
+                        // Add contextual enhancement if query seems to reference previous entities
+                        const pronouns = ['it', 'that', 'this', 'they', 'them', 'those'];
+                        if (pronouns.some(pronoun => message.toLowerCase().includes(pronoun))) {
+                            enhancedQuery += ` (context: ${recentContext.join(', ')})`;
+                        }
+                    }
+                }
+
+                // Execute query
+                const queryResult = await this.neo4j.executeQuery(enhancedQuery, {
+                    sessionId: session.sessionToken,
+                    conversational: true,
+                    ...context
+                });
+
+                // Add entities to session context
+                if (queryResult.results) {
+                    this.sessionStore.addEntityContext(session.sessionToken, queryResult.results);
+                }
+
+                // Format enhanced response
+                const formattedResponse = this.responseFormatter.formatEnhancedResponse(
+                    queryResult, 
+                    message, 
+                    session
+                );
+
+                // Add conversation to history
+                this.sessionStore.addToHistory(session.sessionToken, message, formattedResponse);
+
+                // Build final response
+                const response = {
+                    success: true,
+                    requestId,
+                    timestamp,
+                    sessionToken: session.sessionToken,
+                    conversationId: session.sessionToken, // For compatibility
+                    response: formattedResponse,
+                    conversationContext: {
+                        intent: queryResult.intent?.intent || 'general_search',
+                        entitiesDiscussed: Array.from(session.entityContext).slice(-10),
+                        topicHistory: session.conversationHistory.map(h => h.query).slice(-5),
+                        lastQuery: message,
+                        queryCount: session.totalQueries
+                    },
+                    metadata: {
+                        processingTime: queryResult.metadata?.processingTime || 200,
+                        cached: false,
+                        confidence: 0.95,
+                        dataSource: 'Private Markets Knowledge Store',
+                        sessionAge: Date.now() - session.createdAt.getTime(),
+                        deployment: 'railway-wrapper'
+                    }
+                };
+
+                res.json(response);
+
+            } catch (error) {
+                logger.error('Enhanced wrapper chat error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: {
+                        message: 'Chat processing failed',
+                        requestId: `req_${Date.now()}`,
+                        timestamp: new Date().toISOString()
+                    }
+                });
+            }
+        });
+
+        // Session management endpoints
+        this.app.post('/api/wrapper/session', (req, res) => {
+            try {
+                const { userId, appId, userPreferences } = req.body;
+                
+                const sessionToken = this.sessionStore.createSession(
+                    userId || 'anonymous', 
+                    appId || 'default'
+                );
+                
+                if (userPreferences) {
+                    this.sessionStore.updateSession(sessionToken, { userPreferences });
+                }
+                
+                const session = this.sessionStore.getSession(sessionToken);
+                
+                res.json({
+                    success: true,
+                    sessionToken,
+                    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+                    userPreferences: session.userPreferences,
+                    timestamp: new Date().toISOString()
+                });
+                
+            } catch (error) {
+                logger.error('Session creation error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: 'Failed to create session'
+                });
+            }
+        });
+
+        this.app.get('/api/wrapper/session/:sessionToken', (req, res) => {
+            try {
+                const { sessionToken } = req.params;
+                const session = this.sessionStore.getSession(sessionToken);
+                
+                if (!session) {
+                    return res.status(404).json({
+                        success: false,
+                        error: 'Session not found or expired'
+                    });
+                }
+                
+                res.json({
+                    success: true,
+                    sessionToken: session.sessionToken,
+                    userId: session.userId,
+                    appId: session.appId,
+                    totalQueries: session.totalQueries,
+                    entitiesDiscussed: Array.from(session.entityContext),
+                    conversationLength: session.conversationHistory.length,
+                    lastActivity: session.lastActivity.toISOString(),
+                    userPreferences: session.userPreferences
+                });
+                
+            } catch (error) {
+                logger.error('Session retrieval error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: 'Failed to retrieve session'
+                });
+            }
+        });
+
+        this.app.delete('/api/wrapper/session/:sessionToken', (req, res) => {
+            try {
+                const { sessionToken } = req.params;
+                const session = this.sessionStore.getSession(sessionToken);
+                
+                if (!session) {
+                    return res.status(404).json({
+                        success: false,
+                        error: 'Session not found'
+                    });
+                }
+                
+                this.sessionStore.sessions.delete(sessionToken);
+                
+                res.json({
+                    success: true,
+                    message: 'Session deleted successfully',
+                    timestamp: new Date().toISOString()
+                });
+                
+            } catch (error) {
+                logger.error('Session deletion error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: 'Failed to delete session'
+                });
+            }
+        });
+
+        // Wrapper service stats
+        this.app.get('/api/wrapper/stats', (req, res) => {
+            try {
+                const sessionStats = this.sessionStore.getStats();
+                
+                res.json({
+                    success: true,
+                    data: {
+                        wrapper: {
+                            version: '1.0.0',
+                            deployment: 'railway-integrated',
+                            uptime: process.uptime(),
+                            sessions: sessionStats,
+                            features: {
+                                conversationMemory: true,
+                                contextAwareQueries: true,
+                                richResponses: true,
+                                sessionManagement: true,
+                                visualizationSuggestions: true
+                            }
+                        },
+                        timestamp: new Date().toISOString()
+                    }
+                });
+                
+            } catch (error) {
+                logger.error('Wrapper stats error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: 'Failed to retrieve wrapper stats'
+                });
+            }
+        });
+
         // Analytics endpoint
         this.app.get('/api/agent/analytics', (req, res) => {
             res.json({
@@ -416,11 +1017,28 @@ class PrivateMarketsKnowledgeStore {
     async start() {
         await this.initialize();
         
+        // Railway-specific debugging
+        logger.info(`🔧 Environment variables:`);
+        logger.info(`PORT: ${process.env.PORT}`);
+        logger.info(`NODE_ENV: ${process.env.NODE_ENV}`);
+        logger.info(`Railway variables: RAILWAY_ENVIRONMENT=${process.env.RAILWAY_ENVIRONMENT}`);
+        
         this.server = this.app.listen(this.port, '0.0.0.0', () => {
-            logger.info(`🌐 Private Markets Intelligence Agent running on port ${this.port}`);
+            logger.info(`🌐 Private Markets Intelligence Agent running on host 0.0.0.0 port ${this.port}`);
             logger.info(`🚀 Railway deployment ready!`);
-            logger.info(`📊 Health check: https://your-app.up.railway.app/health`);
-            logger.info(`🔍 Query endpoint: https://your-app.up.railway.app/api/query`);
+            logger.info(`📊 Health check: https://superb-dedication.railway.app/health`);
+            logger.info(`🔍 Query endpoint: https://superb-dedication.railway.app/api/query`);
+            logger.info(`🎯 Root endpoint: https://superb-dedication.railway.app/`);
+            
+            // Test internal connectivity
+            setTimeout(() => {
+                logger.info('🧪 Testing internal routes...');
+                logger.info('Available routes: /, /health, /status, /api/stats, /api/query, /api/agent/query');
+            }, 1000);
+        });
+        
+        this.server.on('error', (error) => {
+            logger.error('❌ Server error:', error);
         });
 
         // Graceful shutdown
