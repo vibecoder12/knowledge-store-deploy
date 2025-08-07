@@ -205,14 +205,34 @@ class PrivateMarketsKnowledgeStore {
                 message: '🎯 Welcome to Private Markets Intelligence Agent',
                 description: 'AI-powered knowledge system for private markets data',
                 version: require('./package.json').version,
+                deployment: 'Railway - Live',
+                status: 'operational',
                 endpoints: {
                     health: '/health',
                     stats: '/api/stats',
-                    query: '/api/query',
-                    agent: '/api/agent/query',
-                    conversation: '/api/agent/conversation'
+                    query: '/api/query (POST)',
+                    agent: '/api/agent/query (POST)',
+                    conversation: '/api/agent/conversation (POST)'
                 },
-                documentation: 'https://github.com/vibecoder12/knowledge-store-deploy'
+                documentation: 'https://github.com/vibecoder12/knowledge-store-deploy',
+                timestamp: new Date().toISOString()
+            });
+        });
+
+        // Alternative health endpoint
+        this.app.get('/status', (req, res) => {
+            res.json({
+                status: 'healthy',
+                timestamp: new Date().toISOString(),
+                version: require('./package.json').version,
+                environment: process.env.NODE_ENV || 'production',
+                deployment: 'railway',
+                port: this.port,
+                components: {
+                    graphDb: this.neo4j.isConnected(),
+                    intelligenceEngine: true,
+                    knowledgeStore: true
+                }
             });
         });
 
